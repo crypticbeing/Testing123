@@ -1,0 +1,9 @@
+# Install PyTorch for your GPU first (see https://pytorch.org/get-started/locally/), then:
+torch>=2.3
+diffusers>=0.30
+transformers>=4.44
+accelerate>=0.33
+safetensors>=0.4
+fastapi>=0.110
+uvicorn>=0.29
+pillow>=10.0
