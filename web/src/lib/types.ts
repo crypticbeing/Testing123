@@ -10,6 +10,7 @@ export type InputImage = z.infer<typeof InputImageSchema>;
 
 // ---------- Stage 1: analysis ----------
 export const AnalysisSchema = z.object({
+  title: z.string().describe("A short 2-5 word name for this project, based on what the images show."),
   summary: z.string().describe("Two or three sentences describing what the images show as a set."),
   subjects: z
     .array(
@@ -97,25 +98,47 @@ export const OptionsSchema = z.object({
 });
 export type TryOption = z.infer<typeof OptionsSchema>["options"][number];
 
+// ---------- Project settings ----------
+export const ASPECTS: Record<string, [number, number]> = {
+  "Square 1:1": [1024, 1024],
+  "Portrait 3:4": [896, 1152],
+  "Landscape 4:3": [1152, 896],
+  "Wide 16:9": [1344, 768],
+  "Tall 9:16": [768, 1344],
+};
+
+export const ProjectSettingsSchema = z.object({
+  count: z.number().int().min(1).max(4),
+  maxRounds: z.number().int().min(1).max(5),
+  targetScore: z.number().min(0).max(100),
+  aspect: z.string().refine((a) => a in ASPECTS, "Unknown aspect"),
+  useReference: z.boolean(),
+  referenceStrength: z.number().min(0.05).max(0.95),
+});
+export type ProjectSettings = z.infer<typeof ProjectSettingsSchema>;
+
+export const DEFAULT_SETTINGS: ProjectSettings = {
+  count: 2,
+  maxRounds: 3,
+  targetScore: 85,
+  aspect: "Square 1:1",
+  useReference: false,
+  referenceStrength: 0.55,
+};
+
 // ---------- Generate request + streamed events ----------
 export const GenerateRequestSchema = z.object({
-  images: z.array(InputImageSchema).min(1).max(6),
-  analysis: AnalysisSchema,
-  answers: z.array(AnswerSchema),
-  direction: z.string().optional(),
-  basePrompt: z.string().optional(),
-  count: z.number().int().min(1).max(4).default(2),
-  maxRounds: z.number().int().min(1).max(5).default(3),
-  targetScore: z.number().min(0).max(100).default(85),
-  useReference: z.boolean().default(false),
-  referenceStrength: z.number().min(0.05).max(0.95).default(0.55),
-  width: z.number().int().min(256).max(1536).default(1024),
-  height: z.number().int().min(256).max(1536).default(1024),
+  projectId: z.string(),
+  answers: z.record(z.string(), z.string()),
+  settings: ProjectSettingsSchema,
+  direction: z.string().max(2000).optional(),
+  basePrompt: z.string().max(4000).optional(),
 });
 export type GenerateRequest = z.infer<typeof GenerateRequestSchema>;
 
 export interface Generation {
   id: string;
+  runId: string;
   variant: number;
   variantTitle: string;
   round: number;
@@ -123,16 +146,33 @@ export interface Generation {
   negativePrompt: string;
   seed: number;
   backend: string;
-  image: string; // data URL
+  image: string; // URL of the saved image
   checklist: string[];
+  createdAt: string;
   critique?: Critique;
 }
 
+/** Run metadata as sent to the browser (the stored run minus its generations). */
+export interface RunInfo {
+  id: string;
+  number: number;
+  startedAt: string;
+  finishedAt: string | null;
+  status: "running" | "done" | "stopped" | "error" | "interrupted";
+  direction?: string;
+  basePrompt?: string;
+  settings: ProjectSettings;
+  plans: PromptPlan[];
+  options: TryOption[];
+  error?: string;
+}
+
 export type GenerateEvent =
+  | { type: "run"; run: RunInfo }
   | { type: "status"; message: string }
-  | { type: "plans"; plans: PromptPlan[] }
+  | { type: "plans"; runId: string; plans: PromptPlan[] }
   | { type: "generation"; generation: Generation }
-  | { type: "critique"; id: string; critique: Critique }
-  | { type: "options"; options: TryOption[] }
+  | { type: "critique"; runId: string; id: string; critique: Critique }
+  | { type: "options"; runId: string; options: TryOption[] }
   | { type: "error"; message: string }
-  | { type: "done" };
+  | { type: "done"; runId: string; status: RunInfo["status"] };

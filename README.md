@@ -6,6 +6,7 @@ A website that turns your reference images into new images while keeping the sma
 2. **Questions.** Claude asks 4–7 questions about your images (what it's for, which details matter most, what to change). Skipped questions use a sensible default.
 3. **Create.** For each variation, Claude writes a prompt, a negative prompt and a checklist. Our own diffusion server draws the image. Claude then compares the result with your references and the checklist, scores it, lists what's missing, rewrites the prompt and draws again. This repeats until the image passes or the round limit is reached.
 4. **Output space.** Every image (every round of every variation) appears in a gallery with its own prompt, negative prompt, seed, score and checklist results. Select one to download it, copy its prompt, or refine it, and pick from the suggested **options to try**.
+5. **Projects and history.** Everything is saved as you go. The home page lists your projects with their best-scoring image as the cover. Inside a project, each generation run is kept in the history (newest first) with its direction, time and status, so you can come back later, compare runs, reuse a prompt, or delete runs you don't need.
 
 ```
 web/        Next.js + TypeScript website and API (Claude: analysis, questions, prompts, self-checks)
@@ -47,10 +48,24 @@ Then set `IMAGE_BACKEND=local` in `web/.env.local` and restart the website. The 
 
 SDXL needs roughly 10 GB of GPU memory. On a Mac with Apple silicon it runs on `mps`; on a CPU it works but is very slow.
 
+## Where projects are saved
+
+Projects are stored as plain files in `web/data/` (change it with `DATA_DIR`). This folder is not committed to git.
+
+```
+data/projects/<project-id>/
+  project.json        name, analysis, questions, your answers, settings, selected image
+  runs/<run-id>.json  one file per run: prompts, every image's prompt and self-check, options to try
+  images/             your reference images and every generated image (PNG)
+```
+
+To back up or move your work, copy the `data` folder. Answers and settings save automatically while you type. A run that was still going when the server stopped shows as "interrupted".
+
+Because projects live on the server's disk, run the site on your own machine or a server with a persistent disk. Serverless hosts such as Vercel wipe the disk, so projects would not survive there.
+
 ## Notes
 
 - **Image-to-image.** Tick "Start from my first image" to begin from your first reference instead of from noise. "Change amount" controls how far the result may move from it.
 - **Same seed for each round.** Refinement rounds keep the seed, so differences between rounds come from the corrected prompt.
 - **Cost.** Each self-check sends your references plus the new image to Claude. Two variations with three rounds each means up to 6 checks, plus one call each for analysis, questions, prompts and options.
 - **Refusal fallback.** Claude calls opt in to server-side refusal fallbacks (`fallbacks: "default"`), so a safety decline is retried on another model before an error is shown.
-- Nothing is stored on the server. Images and results live in your browser tab until you start a new project.

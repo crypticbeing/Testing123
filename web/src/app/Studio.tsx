@@ -1,19 +1,24 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import Link from "next/link";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { Project } from "@/lib/store";
 import styles from "./studio.module.css";
-import type {
-  Analysis,
-  Answer,
-  GenerateEvent,
-  Generation,
-  InputImage,
-  PromptPlan,
-  Question,
-  TryOption,
+import {
+  ASPECTS,
+  DEFAULT_SETTINGS,
+  type Analysis,
+  type GenerateEvent,
+  type Generation,
+  type InputImage,
+  type ProjectSettings,
+  type Question,
+  type RunInfo,
 } from "@/lib/types";
 
 type Stage = "upload" | "questions" | "create";
+type RunView = RunInfo & { generations: Generation[] };
+type RefImage = Partial<InputImage> & { preview: string };
 
 interface Status {
   claudeModel: string;
@@ -21,14 +26,6 @@ interface Status {
   backend: string;
   generator: { ok: boolean; model?: string; error?: string };
 }
-
-const ASPECTS: Record<string, [number, number]> = {
-  "Square 1:1": [1024, 1024],
-  "Portrait 3:4": [896, 1152],
-  "Landscape 4:3": [1152, 896],
-  "Wide 16:9": [1344, 768],
-  "Tall 9:16": [768, 1344],
-};
 
 /** Resize an uploaded file in the browser so requests stay small (longest side ≤ 1280px, JPEG). */
 async function fileToInputImage(file: File): Promise<InputImage & { preview: string }> {
@@ -55,39 +52,43 @@ async function fileToInputImage(file: File): Promise<InputImage & { preview: str
   }
 }
 
-async function postJson<T>(url: string, body: unknown): Promise<T> {
-  const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+async function api<T>(url: string, method: string, body?: unknown): Promise<T> {
+  const res = await fetch(url, {
+    method,
+    headers: body === undefined ? undefined : { "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (res.status === 204) return undefined as T;
   const json = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(json.error ?? `Request failed (${res.status})`);
   return json as T;
 }
 
-export default function Studio() {
+function formatTime(iso: string) {
+  return new Date(iso).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+
+export default function Studio({ projectId: initialProjectId }: { projectId?: string }) {
   const [status, setStatus] = useState<Status | null>(null);
+  const [projectId, setProjectId] = useState<string | null>(initialProjectId ?? null);
+  const [name, setName] = useState("New project");
+  const [loading, setLoading] = useState(Boolean(initialProjectId));
   const [stage, setStage] = useState<Stage>("upload");
-  const [images, setImages] = useState<(InputImage & { preview: string })[]>([]);
+  const [images, setImages] = useState<RefImage[]>([]);
   const [analysis, setAnalysis] = useState<Analysis | null>(null);
   const [questions, setQuestions] = useState<Question[]>([]);
   const [answers, setAnswers] = useState<Record<string, string>>({});
+  const [settings, setSettings] = useState<ProjectSettings>(DEFAULT_SETTINGS);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  // generation settings
-  const [count, setCount] = useState(2);
-  const [maxRounds, setMaxRounds] = useState(3);
-  const [targetScore, setTargetScore] = useState(85);
-  const [aspect, setAspect] = useState("Square 1:1");
-  const [useReference, setUseReference] = useState(false);
-  const [strength, setStrength] = useState(0.55);
-
-  // results
-  const [generations, setGenerations] = useState<Generation[]>([]);
-  const [plans, setPlans] = useState<PromptPlan[]>([]);
-  const [options, setOptions] = useState<TryOption[]>([]);
+  const [runs, setRuns] = useState<RunView[]>([]);
   const [log, setLog] = useState<string[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [customDirection, setCustomDirection] = useState("");
+  const [running, setRunning] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
+  const loadedRef = useRef(!initialProjectId); // don't autosave before the project is loaded
 
   useEffect(() => {
     fetch("/api/status")
@@ -96,13 +97,44 @@ export default function Studio() {
       .catch(() => setStatus(null));
   }, []);
 
-  const selected = useMemo(() => generations.find((g) => g.id === selectedId) ?? null, [generations, selectedId]);
+  // ---------- load a saved project ----------
+  useEffect(() => {
+    if (!initialProjectId) return;
+    api<{ project: Project; runs: RunView[] }>(`/api/projects/${initialProjectId}`, "GET")
+      .then(({ project, runs }) => {
+        setName(project.name);
+        setImages(project.references.map((r) => ({ preview: `/api/projects/${project.id}/images/${r.file}`, name: r.name })));
+        setAnalysis(project.analysis);
+        setQuestions(project.questions);
+        setAnswers(project.answers);
+        setSettings({ ...DEFAULT_SETTINGS, ...project.settings });
+        setRuns(runs);
+        setSelectedId(project.selectedId ?? runs[0]?.generations.at(-1)?.id ?? null);
+        setStage(runs.length > 0 ? "create" : project.analysis ? "questions" : "upload");
+        loadedRef.current = true;
+      })
+      .catch((e) => setError((e as Error).message))
+      .finally(() => setLoading(false));
+  }, [initialProjectId]);
 
-  const answerList = useCallback(
-    (): Answer[] =>
-      questions.map((q) => ({ question: q.question, answer: answers[q.id]?.trim() || `(skipped – assume: ${q.default_answer})` })),
-    [questions, answers],
+  // ---------- autosave answers, settings and selection ----------
+  useEffect(() => {
+    if (!projectId || !loadedRef.current) return;
+    const t = setTimeout(() => {
+      void api(`/api/projects/${projectId}`, "PATCH", { answers, settings, selectedId }).catch(() => {});
+    }, 600);
+    return () => clearTimeout(t);
+  }, [projectId, answers, settings, selectedId]);
+
+  const allGenerations = useMemo(() => runs.flatMap((r) => r.generations), [runs]);
+  const selected = useMemo(() => allGenerations.find((g) => g.id === selectedId) ?? null, [allGenerations, selectedId]);
+  const optionsRun = useMemo(
+    () => (selected ? runs.find((r) => r.id === selected.runId) : undefined) ?? runs.find((r) => r.options.length > 0),
+    [runs, selected],
   );
+
+  const set = <K extends keyof ProjectSettings>(key: K, value: ProjectSettings[K]) =>
+    setSettings((s) => ({ ...s, [key]: value }));
 
   // ---------------- stage 1 ----------------
   async function addFiles(files: FileList | File[]) {
@@ -113,22 +145,31 @@ export default function Studio() {
     try {
       const converted = await Promise.all(list.slice(0, room).map(fileToInputImage));
       setImages((prev) => [...prev, ...converted]);
-      setAnalysis(null);
     } catch (e) {
       setError((e as Error).message);
     }
   }
 
-  const payloadImages = () => images.map(({ mediaType, data, name }) => ({ mediaType, data, name }));
-
   async function runAnalysis() {
     setError(null);
     try {
+      let id = projectId;
+      if (!id) {
+        setBusy("Saving your project…");
+        const payload = images.map(({ mediaType, data, name }) => ({ mediaType, data, name }));
+        const { project } = await api<{ project: { id: string; name: string } }>("/api/projects", "POST", { images: payload });
+        id = project.id;
+        setProjectId(id);
+        loadedRef.current = true;
+        // Update the URL without remounting, so a refresh reopens this project.
+        window.history.replaceState(null, "", `/p/${id}`);
+      }
       setBusy("Stage 1 · Analysing every detail of your images…");
-      const { analysis } = await postJson<{ analysis: Analysis }>("/api/analyze", { images: payloadImages() });
-      setAnalysis(analysis);
+      const res = await api<{ analysis: Analysis; name: string }>("/api/analyze", "POST", { projectId: id });
+      setAnalysis(res.analysis);
+      setName(res.name);
       setBusy("Stage 2 · Preparing questions about your images…");
-      const { questions } = await postJson<{ questions: Question[] }>("/api/questions", { images: payloadImages(), analysis });
+      const { questions } = await api<{ questions: Question[] }>("/api/questions", "POST", { projectId: id });
       setQuestions(questions);
       setAnswers({});
       setStage("questions");
@@ -141,15 +182,14 @@ export default function Studio() {
 
   // ---------------- stage 3 ----------------
   async function runGenerate(extra: { direction?: string; basePrompt?: string } = {}) {
-    if (!analysis) return;
+    if (!analysis || !projectId) return;
     setError(null);
     setStage("create");
-    setOptions([]);
     setLog([]);
     abortRef.current?.abort();
     const ctrl = new AbortController();
     abortRef.current = ctrl;
-    const [width, height] = ASPECTS[aspect];
+    setRunning(true);
     setBusy(extra.direction ? `Trying: ${extra.direction}` : "Stage 3 · Creating…");
 
     try {
@@ -157,19 +197,7 @@ export default function Studio() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         signal: ctrl.signal,
-        body: JSON.stringify({
-          images: payloadImages(),
-          analysis,
-          answers: answerList(),
-          count,
-          maxRounds,
-          targetScore,
-          useReference,
-          referenceStrength: strength,
-          width,
-          height,
-          ...extra,
-        }),
+        body: JSON.stringify({ projectId, answers, settings, ...extra }),
       });
       if (!res.ok || !res.body) {
         const j = await res.json().catch(() => ({}));
@@ -194,36 +222,49 @@ export default function Studio() {
     } finally {
       if (abortRef.current === ctrl) {
         abortRef.current = null;
+        setRunning(false);
         setBusy(null);
       }
     }
   }
 
+  const patchRun = (id: string, fn: (r: RunView) => RunView) => setRuns((rs) => rs.map((r) => (r.id === id ? fn(r) : r)));
+
   function handleEvent(e: GenerateEvent) {
     switch (e.type) {
+      case "run":
+        setRuns((rs) => [{ ...e.run, generations: [] }, ...rs]);
+        break;
       case "status":
         setBusy(e.message);
         setLog((l) => [...l, e.message]);
         break;
       case "plans":
-        setPlans(e.plans);
+        patchRun(e.runId, (r) => ({ ...r, plans: e.plans }));
         break;
       case "generation":
-        setGenerations((g) => [e.generation, ...g]);
-        setSelectedId((cur) => cur ?? e.generation.id);
+        patchRun(e.generation.runId, (r) => ({ ...r, generations: [...r.generations, e.generation] }));
+        setSelectedId(e.generation.id);
         break;
       case "critique":
-        setGenerations((g) => g.map((x) => (x.id === e.id ? { ...x, critique: e.critique } : x)));
-        setLog((l) => [...l, `Score ${Math.round(e.critique.score)} · ${e.critique.verdict === "accept" ? "accepted" : "refining"} – ${e.critique.notes}`]);
+        patchRun(e.runId, (r) => ({
+          ...r,
+          generations: r.generations.map((g) => (g.id === e.id ? { ...g, critique: e.critique } : g)),
+        }));
+        setLog((l) => [
+          ...l,
+          `Score ${Math.round(e.critique.score)} · ${e.critique.verdict === "accept" ? "accepted" : "refining"}: ${e.critique.notes}`,
+        ]);
         break;
       case "options":
-        setOptions(e.options);
+        patchRun(e.runId, (r) => ({ ...r, options: e.options }));
         break;
       case "error":
         setError(e.message);
         break;
       case "done":
-        setLog((l) => [...l, "Done."]);
+        patchRun(e.runId, (r) => ({ ...r, status: e.status, finishedAt: new Date().toISOString() }));
+        setLog((l) => [...l, e.status === "done" ? "Done." : `Run ${e.status}.`]);
         break;
     }
   }
@@ -231,40 +272,68 @@ export default function Studio() {
   function stop() {
     abortRef.current?.abort();
     abortRef.current = null;
+    setRunning(false);
     setBusy(null);
+    setRuns((rs) => rs.map((r) => (r.status === "running" ? { ...r, status: "stopped" } : r)));
   }
 
   function tryOption(direction: string) {
     void runGenerate({ direction, basePrompt: selected?.prompt });
   }
 
-  function startOver() {
-    stop();
-    setStage("upload");
-    setImages([]);
-    setAnalysis(null);
-    setQuestions([]);
-    setAnswers({});
-    setGenerations([]);
-    setPlans([]);
-    setOptions([]);
-    setSelectedId(null);
-    setError(null);
+  async function rename(newName: string) {
+    const trimmed = newName.trim();
+    if (!projectId || !trimmed || trimmed === name) return;
+    setName(trimmed);
+    await api(`/api/projects/${projectId}`, "PATCH", { name: trimmed }).catch((e) => setError((e as Error).message));
+  }
+
+  async function removeRun(run: RunView) {
+    if (!projectId || !confirm(`Delete run ${run.number} and its ${run.generations.length} images?`)) return;
+    try {
+      await api(`/api/projects/${projectId}/runs/${run.id}`, "DELETE");
+      setRuns((rs) => rs.filter((r) => r.id !== run.id));
+      if (run.generations.some((g) => g.id === selectedId)) setSelectedId(null);
+    } catch (e) {
+      setError((e as Error).message);
+    }
   }
 
   // ---------------- render ----------------
+  if (loading) {
+    return (
+      <div className={styles.shell}>
+        <div className={styles.busy}>
+          <span className={styles.spinner} /> Opening project…
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className={styles.shell}>
       <header className={styles.header}>
-        <div className={styles.brand}>
+        <Link href="/" className={styles.brand}>
           <span className={styles.logo}>◆</span> Detail Studio
-        </div>
+        </Link>
+        {projectId ? (
+          <input
+            className={styles.projectName}
+            defaultValue={name}
+            key={name}
+            aria-label="Project name"
+            onBlur={(e) => void rename(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && (e.target as HTMLInputElement).blur()}
+          />
+        ) : (
+          <span className={styles.projectNameStatic}>New project</span>
+        )}
         <nav className={styles.steps}>
           {(["upload", "questions", "create"] as Stage[]).map((s, i) => (
             <button
               key={s}
               className={`${styles.step} ${stage === s ? styles.stepActive : ""}`}
-              disabled={(s === "questions" && !analysis) || (s === "create" && !analysis)}
+              disabled={s !== "upload" && !analysis}
               onClick={() => setStage(s)}
             >
               <span>{i + 1}</span> {s === "upload" ? "Analyse" : s === "questions" ? "Questions" : "Create"}
@@ -283,41 +352,49 @@ export default function Studio() {
       {busy && (
         <div className={styles.busy}>
           <span className={styles.spinner} /> {busy}
-          {abortRef.current && <button className={styles.linkBtn} onClick={stop}>Stop</button>}
+          {running && <button className={styles.linkBtn} onClick={stop}>Stop</button>}
         </div>
       )}
 
       {stage === "upload" && (
         <section className={styles.panel}>
-          <h2>1 · Upload your reference images</h2>
-          <p className={styles.muted}>Add up to 6 images. They are analysed for subjects, style and every small detail worth keeping.</p>
-          <label
-            className={styles.drop}
-            onDragOver={(e) => e.preventDefault()}
-            onDrop={(e) => {
-              e.preventDefault();
-              void addFiles(e.dataTransfer.files);
-            }}
-          >
-            <input type="file" accept="image/*" multiple hidden onChange={(e) => e.target.files && void addFiles(e.target.files)} />
-            <strong>Drop images here</strong> or click to choose
-          </label>
+          <h2>1 · {projectId ? "Your reference images" : "Upload your reference images"}</h2>
+          {!projectId ? (
+            <>
+              <p className={styles.muted}>Add up to 6 images. They are analysed for subjects, style and every small detail worth keeping.</p>
+              <label
+                className={styles.drop}
+                onDragOver={(e) => e.preventDefault()}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  void addFiles(e.dataTransfer.files);
+                }}
+              >
+                <input type="file" accept="image/*" multiple hidden onChange={(e) => e.target.files && void addFiles(e.target.files)} />
+                <strong>Drop images here</strong> or click to choose
+              </label>
+            </>
+          ) : (
+            <p className={styles.muted}>These images are saved with the project. Start a new project to use different ones.</p>
+          )}
           {images.length > 0 && (
             <div className={styles.thumbs}>
               {images.map((img, i) => (
                 <figure key={i} className={styles.thumb}>
                   {/* eslint-disable-next-line @next/next/no-img-element */}
                   <img src={img.preview} alt={img.name ?? `Reference ${i + 1}`} />
-                  <button aria-label="Remove image" onClick={() => setImages((p) => p.filter((_, j) => j !== i))}>×</button>
+                  {!projectId && (
+                    <button aria-label="Remove image" onClick={() => setImages((p) => p.filter((_, j) => j !== i))}>×</button>
+                  )}
                 </figure>
               ))}
             </div>
           )}
           <div className={styles.actions}>
             <button className={styles.primary} disabled={images.length === 0 || !!busy} onClick={runAnalysis}>
-              Analyse images
+              {analysis ? "Analyse again" : "Analyse images"}
             </button>
-            {images.length > 0 && <button className={styles.ghost} onClick={startOver}>Clear</button>}
+            {analysis && <button className={styles.ghost} onClick={() => setStage("questions")}>Continue to questions</button>}
           </div>
           {analysis && <AnalysisCard analysis={analysis} />}
         </section>
@@ -326,7 +403,7 @@ export default function Studio() {
       {stage === "questions" && analysis && (
         <section className={styles.panel}>
           <h2>2 · A few questions about your images</h2>
-          <p className={styles.muted}>Answer what matters to you. Skipped questions use the suggested default.</p>
+          <p className={styles.muted}>Answer what matters to you. Skipped questions use the suggested default. Answers save automatically.</p>
           <details className={styles.analysisToggle}>
             <summary>Show stage 1 analysis</summary>
             <AnalysisCard analysis={analysis} />
@@ -363,34 +440,47 @@ export default function Studio() {
           <div className={styles.settings}>
             <label>
               Variations
-              <select value={count} onChange={(e) => setCount(Number(e.target.value))}>
+              <select value={settings.count} onChange={(e) => set("count", Number(e.target.value))}>
                 {[1, 2, 3, 4].map((n) => <option key={n}>{n}</option>)}
               </select>
             </label>
             <label>
               Self-correction rounds
-              <select value={maxRounds} onChange={(e) => setMaxRounds(Number(e.target.value))}>
+              <select value={settings.maxRounds} onChange={(e) => set("maxRounds", Number(e.target.value))}>
                 {[1, 2, 3, 4, 5].map((n) => <option key={n}>{n}</option>)}
               </select>
             </label>
             <label>
               Accept at score
-              <input type="number" min={50} max={100} value={targetScore} onChange={(e) => setTargetScore(Number(e.target.value))} />
+              <input
+                type="number"
+                min={50}
+                max={100}
+                value={settings.targetScore}
+                onChange={(e) => set("targetScore", Math.min(100, Math.max(0, Number(e.target.value) || 0)))}
+              />
             </label>
             <label>
               Aspect
-              <select value={aspect} onChange={(e) => setAspect(e.target.value)}>
+              <select value={settings.aspect} onChange={(e) => set("aspect", e.target.value)}>
                 {Object.keys(ASPECTS).map((a) => <option key={a}>{a}</option>)}
               </select>
             </label>
             <label className={styles.check}>
-              <input type="checkbox" checked={useReference} onChange={(e) => setUseReference(e.target.checked)} />
+              <input type="checkbox" checked={settings.useReference} onChange={(e) => set("useReference", e.target.checked)} />
               Start from my first image (image-to-image)
             </label>
-            {useReference && (
+            {settings.useReference && (
               <label>
-                Change amount {strength.toFixed(2)}
-                <input type="range" min={0.1} max={0.9} step={0.05} value={strength} onChange={(e) => setStrength(Number(e.target.value))} />
+                Change amount {settings.referenceStrength.toFixed(2)}
+                <input
+                  type="range"
+                  min={0.1}
+                  max={0.9}
+                  step={0.05}
+                  value={settings.referenceStrength}
+                  onChange={(e) => set("referenceStrength", Number(e.target.value))}
+                />
               </label>
             )}
           </div>
@@ -398,6 +488,7 @@ export default function Studio() {
             <button className={styles.primary} disabled={!!busy} onClick={() => void runGenerate()}>
               Generate
             </button>
+            {runs.length > 0 && <button className={styles.ghost} onClick={() => setStage("create")}>View history</button>}
             <button className={styles.ghost} onClick={() => setStage("upload")}>Back</button>
           </div>
         </section>
@@ -407,50 +498,71 @@ export default function Studio() {
         <section className={styles.create}>
           <div className={styles.galleryCol}>
             <h2>3 · Output space</h2>
-            {plans.length > 0 && (
-              <div className={styles.plans}>
-                {plans.map((p, i) => (
-                  <span key={i} className={styles.planTag} title={p.rationale}>{p.title}</span>
-                ))}
-              </div>
-            )}
-            {generations.length === 0 && <p className={styles.muted}>Images appear here as they are generated and checked.</p>}
-            <div className={styles.gallery}>
-              {generations.map((g) => (
-                <button
-                  key={g.id}
-                  className={`${styles.card} ${g.id === selectedId ? styles.cardOn : ""}`}
-                  onClick={() => setSelectedId(g.id)}
-                >
-                  {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img src={g.image} alt={g.prompt} />
-                  <div className={styles.cardMeta}>
-                    <span>{g.variantTitle} · round {g.round}</span>
-                    <ScoreBadge g={g} />
-                  </div>
-                </button>
-              ))}
-            </div>
+            <p className={styles.muted}>
+              {runs.length === 0
+                ? "Images appear here as they are generated and checked."
+                : `${runs.length} run${runs.length === 1 ? "" : "s"} · ${allGenerations.length} images, newest run first. Everything is saved.`}
+            </p>
             {log.length > 0 && (
               <details className={styles.log}>
                 <summary>Activity log ({log.length})</summary>
                 <ol>{log.map((l, i) => <li key={i}>{l}</li>)}</ol>
               </details>
             )}
+            {runs.map((run) => (
+              <div key={run.id} className={styles.run}>
+                <div className={styles.runHead}>
+                  <div>
+                    <strong>Run {run.number}</strong>
+                    <span className={styles.runDir}>{run.direction ? ` · ${run.direction}` : " · From your answers"}</span>
+                  </div>
+                  <div className={styles.runMeta}>
+                    <span className={`${styles.runStatus} ${styles[`st_${run.status}`] ?? ""}`}>{run.status}</span>
+                    <span>{formatTime(run.startedAt)}</span>
+                    {run.status !== "running" && (
+                      <button className={styles.linkBtn} onClick={() => void removeRun(run)} aria-label={`Delete run ${run.number}`}>
+                        Delete
+                      </button>
+                    )}
+                  </div>
+                </div>
+                {run.error && <div className={styles.runError}>{run.error}</div>}
+                {run.generations.length === 0 ? (
+                  <p className={styles.muted}>{run.status === "running" ? "Working…" : "No images in this run."}</p>
+                ) : (
+                  <div className={styles.gallery}>
+                    {run.generations.map((g) => (
+                      <button
+                        key={g.id}
+                        className={`${styles.card} ${g.id === selectedId ? styles.cardOn : ""}`}
+                        onClick={() => setSelectedId(g.id)}
+                      >
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                        <img src={g.image} alt={g.prompt} loading="lazy" />
+                        <div className={styles.cardMeta}>
+                          <span>{g.variantTitle} · round {g.round}</span>
+                          <ScoreBadge g={g} />
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ))}
           </div>
 
           <aside className={styles.side}>
             {selected ? (
-              <SelectedPanel g={selected} />
+              <SelectedPanel g={selected} runNumber={runs.find((r) => r.id === selected.runId)?.number} />
             ) : (
               <p className={styles.muted}>Select an image to see its prompt and review.</p>
             )}
 
             <div className={styles.optionsBox}>
-              <h3>Options to try</h3>
-              {options.length === 0 && <p className={styles.muted}>Suggestions appear after a run finishes.</p>}
+              <h3>Options to try{optionsRun ? ` · from run ${optionsRun.number}` : ""}</h3>
+              {!optionsRun?.options.length && <p className={styles.muted}>Suggestions appear after a run finishes.</p>}
               <div className={styles.optionList}>
-                {options.map((o) => (
+                {optionsRun?.options.map((o) => (
                   <button key={o.title} className={styles.option} disabled={!!busy} onClick={() => tryOption(o.direction)}>
                     <strong>{o.title}</strong>
                     <span>{o.direction}</span>
@@ -475,7 +587,7 @@ export default function Studio() {
               <div className={styles.actions}>
                 <button className={styles.ghost} disabled={!!busy} onClick={() => void runGenerate()}>Generate again</button>
                 <button className={styles.ghost} onClick={() => setStage("questions")}>Edit answers</button>
-                <button className={styles.ghost} onClick={startOver}>New project</button>
+                <Link className={styles.ghost} href="/">All projects</Link>
               </div>
             </div>
           </aside>
@@ -487,10 +599,11 @@ export default function Studio() {
 
 function StatusPill({ status }: { status: Status | null }) {
   if (!status) return <div className={styles.pill}>checking…</div>;
-  const problems = [!status.claudeKey && "no Claude API key", !status.generator.ok && `generator ${status.generator.error}`].filter(Boolean);
+  const s = status;
+  const problems = [!s.claudeKey && "no Claude API key", !s.generator.ok && `generator ${s.generator.error}`].filter(Boolean);
   return (
     <div className={`${styles.pill} ${problems.length ? styles.pillWarn : ""}`} title={problems.join(", ")}>
-      {status.backend === "mock" ? "mock images" : status.generator.model ?? "local generator"}
+      {s.backend === "mock" ? "mock images" : s.generator.model ?? "local generator"}
       {problems.length > 0 && ` · ${problems.join(", ")}`}
     </div>
   );
@@ -502,7 +615,7 @@ function ScoreBadge({ g }: { g: Generation }) {
   return <span className={`${styles.badge} ${s >= 85 ? styles.good : s >= 60 ? styles.ok : styles.bad}`}>{s}</span>;
 }
 
-function SelectedPanel({ g }: { g: Generation }) {
+function SelectedPanel({ g, runNumber }: { g: Generation; runNumber?: number }) {
   const [copied, setCopied] = useState(false);
   const c = g.critique;
   return (
@@ -527,8 +640,12 @@ function SelectedPanel({ g }: { g: Generation }) {
         <dd className={styles.prompt}>{g.prompt}</dd>
         <dt>Negative prompt</dt>
         <dd className={styles.promptNeg}>{g.negativePrompt}</dd>
-        <dt>Seed · model</dt>
-        <dd>{g.seed} · {g.backend}</dd>
+        <dt>Run · seed · model</dt>
+        <dd>
+          {runNumber ? `Run ${runNumber}, ` : ""}
+          {g.variantTitle} round {g.round} · {g.seed} · {g.backend}
+          {g.createdAt ? ` · ${formatTime(g.createdAt)}` : ""}
+        </dd>
       </dl>
       {c && (
         <div className={styles.review}>

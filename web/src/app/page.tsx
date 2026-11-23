@@ -1,5 +1,5 @@
-import Studio from "./Studio";
+import ProjectList from "./ProjectList";
 
 export default function Home() {
-  return <Studio />;
+  return <ProjectList />;
 }
